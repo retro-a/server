@@ -1,1 +1,192 @@
+name: Ubuntu Cloud SSH
 
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # GitHub Hosted Runner max = 6 hours
+    timeout-minutes: 360
+
+    steps:
+
+      # ============================================================
+      # 1. Install SSH Server
+      # ============================================================
+      - name: 1. Install & Configure SSH
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          echo "Updating packages..."
+          sudo apt-get update
+
+          echo "Installing SSH server..."
+          sudo apt-get install -y openssh-server curl
+
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+
+          echo "Creating admin user..."
+
+          if ! id "ubuntuadmin" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash ubuntuadmin
+          fi
+
+          echo "ubuntuadmin:${SSH_PASSWORD}" | sudo chpasswd
+
+          sudo usermod -aG sudo ubuntuadmin
+
+          echo "ubuntuadmin ALL=(ALL) NOPASSWD:ALL" | \
+            sudo tee /etc/sudoers.d/ubuntuadmin
+
+          sudo chmod 440 /etc/sudoers.d/ubuntuadmin
+
+          echo "Configuring SSH..."
+
+          sudo tee /etc/ssh/sshd_config.d/99-github-remote.conf > /dev/null <<EOF
+          PasswordAuthentication yes
+          PermitRootLogin no
+          PubkeyAuthentication yes
+          EOF
+
+          sudo sshd -t
+
+          sudo systemctl restart ssh
+
+          echo "SSH server configured successfully."
+
+
+      # ============================================================
+      # 2. Install Tailscale
+      # ============================================================
+      - name: 2. Install Tailscale
+        run: |
+          echo "Installing Tailscale..."
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          echo "Tailscale installed successfully."
+
+
+      # ============================================================
+      # 3. Connect to Tailscale
+      # ============================================================
+      - name: 3. Connect Tailscale VPN
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "Connecting to Tailscale..."
+
+          sudo tailscale up \
+            --auth-key="$TAILSCALE_AUTHKEY" \
+            --hostname="github-ubuntu-${GITHUB_RUN_ID}"
+
+          sleep 5
+
+          TS_IP=$(sudo tailscale ip -4 | head -n 1)
+
+          echo ""
+          echo "=========================================================="
+          echo "             UBUNTU SERVER IS READY"
+          echo "=========================================================="
+          echo ""
+          echo "Tailscale IP : $TS_IP"
+          echo "Username     : ubuntuadmin"
+          echo ""
+          echo "SSH command:"
+          echo ""
+          echo "ssh ubuntuadmin@$TS_IP"
+          echo ""
+          echo "Password = SSH_PASSWORD GitHub Secret"
+          echo ""
+          echo "=========================================================="
+
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+
+      # ============================================================
+      # 4. Show Server Information
+      # ============================================================
+      - name: 4. Server Information
+        run: |
+          echo ""
+          echo "================ SERVER INFO ================"
+          echo ""
+
+          echo "Hostname:"
+          hostname
+
+          echo ""
+          echo "Operating System:"
+          cat /etc/os-release
+
+          echo ""
+          echo "CPU:"
+          lscpu | grep "Model name" | head -1
+
+          echo ""
+          echo "RAM:"
+          free -h
+
+          echo ""
+          echo "Disk:"
+          df -h /
+
+          echo ""
+          echo "Public IP:"
+          curl -s https://api.ipify.org || true
+
+          echo ""
+          echo ""
+          echo "Tailscale IP:"
+          echo "$TAILSCALE_IP"
+
+          echo ""
+          echo "SSH:"
+          echo "ssh ubuntuadmin@$TAILSCALE_IP"
+
+          echo ""
+          echo "============================================="
+
+
+      # ============================================================
+      # 5. Keep Server Alive
+      #
+      # Keep it below GitHub's 6-hour job limit so cleanup has
+      # enough time to execute.
+      # ============================================================
+      - name: 5. Keep Ubuntu Server Alive
+        run: |
+          echo ""
+          echo "Ubuntu server is running..."
+          echo "SSH: ubuntuadmin@$TAILSCALE_IP"
+          echo ""
+
+          # 345 minutes = 5 hours 45 minutes
+          for i in $(seq 1 345)
+          do
+            sleep 60
+
+            echo "[$i/345] Server running | IP: $TAILSCALE_IP"
+
+            # Show status every 10 minutes
+            if (( i % 10 == 0 )); then
+              echo ""
+              echo "------ Server Status ------"
+              uptime
+              free -h | grep Mem
+              echo "---------------------------"
+            fi
+          done
+
+
+      # ============================================================
+      # 6. Cleanup
+      # ============================================================
+      - name: 6. Disconnect Tailscale
+        if: always()
+        run: |
+          echo "Disconnecting Tailscale..."
+          sudo tailscale logout || true
